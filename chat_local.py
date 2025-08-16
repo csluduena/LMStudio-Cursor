@@ -14,7 +14,7 @@ class ChatApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Chat con IA Local - Práctica de Inglés")
-        self.root.geometry("800x700")
+        self.root.geometry("1200x700")  # Ventana más ancha para el panel
         
         # Cola para comunicación entre hilos
         self.message_queue = queue.Queue()
@@ -37,6 +37,9 @@ class ChatApp:
         self.min_phrase_duration = 0.5  # duración mínima de una frase
         self.is_processing_audio = False
         
+        # Configuración de respuesta
+        self.response_mode = tk.StringVar(value="TEXT + TTS")  # TEXT, TTS, TEXT + TTS
+        
         # Cargar modelo en hilo separado
         self.model = None
         self.model_loaded = False
@@ -47,29 +50,41 @@ class ChatApp:
         self.check_model_status()
     
     def setup_ui(self):
-        # Frame principal
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        # Frame principal con dos columnas
+        main_container = ttk.Frame(self.root, padding="10")
+        main_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Configurar grid
+        # Configurar grid principal
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(1, weight=1)
+        main_container.columnconfigure(0, weight=3)  # Chat area
+        main_container.columnconfigure(1, weight=1)  # Panel de configuración
+        main_container.rowconfigure(0, weight=1)
+        
+        # === PANEL IZQUIERDO: CHAT ===
+        self.setup_chat_panel(main_container)
+        
+        # === PANEL DERECHO: CONFIGURACIÓN ===
+        self.setup_config_panel(main_container)
+    
+    def setup_chat_panel(self, container):
+        """Configura el panel izquierdo del chat"""
+        chat_frame = ttk.Frame(container, padding="5")
+        chat_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
         
         # Título
-        title_label = ttk.Label(main_frame, text="💬 Chat con IA Local - Práctica de Inglés", 
+        title_label = ttk.Label(chat_frame, text="💬 Chat con IA Local - Práctica de Inglés", 
                                font=("Arial", 16, "bold"))
         title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
         
         # Área de chat
-        self.chat_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, height=20, 
+        self.chat_area = scrolledtext.ScrolledText(chat_frame, wrap=tk.WORD, height=20, 
                                                  font=("Arial", 10))
         self.chat_area.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), 
                            pady=(0, 10))
         
         # Frame para entrada y botones
-        input_frame = ttk.Frame(main_frame)
+        input_frame = ttk.Frame(chat_frame)
         input_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
         input_frame.columnconfigure(0, weight=1)
         
@@ -87,7 +102,7 @@ class ChatApp:
         self.speak_button.grid(row=0, column=2)
         
         # Frame para controles de voz
-        voice_frame = ttk.Frame(main_frame)
+        voice_frame = ttk.Frame(chat_frame)
         voice_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
         voice_frame.columnconfigure(0, weight=1)
         
@@ -104,12 +119,135 @@ class ChatApp:
         
         # Barra de estado
         self.status_var = tk.StringVar(value="Cargando modelo...")
-        status_bar = ttk.Label(main_frame, textvariable=self.status_var, 
+        status_bar = ttk.Label(chat_frame, textvariable=self.status_var, 
                               relief=tk.SUNKEN, anchor=tk.W)
         status_bar.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E))
         
         # Configurar entrada inicial
         self.input_field.focus()
+    
+    def setup_config_panel(self, container):
+        """Configura el panel derecho de configuración"""
+        config_frame = ttk.LabelFrame(container, text="⚙️ Configuración", padding="10")
+        config_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(10, 0))
+        
+        # === MODO DE RESPUESTA ===
+        response_frame = ttk.LabelFrame(config_frame, text="🎯 Modo de Respuesta", padding="5")
+        response_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # Opciones de modo de respuesta
+        ttk.Radiobutton(response_frame, text="Solo Texto", variable=self.response_mode, 
+                       value="TEXT").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Radiobutton(response_frame, text="Solo Voz (TTS)", variable=self.response_mode, 
+                       value="TTS").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Radiobutton(response_frame, text="Texto + Voz", variable=self.response_mode, 
+                       value="TEXT + TTS").grid(row=2, column=0, sticky=tk.W, pady=2)
+        
+        # === CONFIGURACIÓN DE VOZ ===
+        voice_config_frame = ttk.LabelFrame(config_frame, text="🎤 Configuración de Voz", padding="5")
+        voice_config_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # Umbral de silencio
+        ttk.Label(voice_config_frame, text="Pausa para fin de frase:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        
+        silence_frame = ttk.Frame(voice_config_frame)
+        silence_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=2)
+        
+        self.silence_slider = ttk.Scale(silence_frame, from_=1.0, to=10.0, 
+                                       orient=tk.HORIZONTAL, length=150,
+                                       command=self.update_silence_threshold)
+        self.silence_slider.set(self.silence_threshold)
+        self.silence_slider.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        self.silence_label = ttk.Label(silence_frame, text=f"{self.silence_threshold:.1f}s")
+        self.silence_label.grid(row=0, column=1, padx=(5, 0))
+        
+        # Velocidad de habla
+        ttk.Label(voice_config_frame, text="Velocidad de habla:").grid(row=2, column=0, sticky=tk.W, pady=(10, 2))
+        
+        speed_frame = ttk.Frame(voice_config_frame)
+        speed_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=2)
+        
+        self.speed_slider = ttk.Scale(speed_frame, from_=50, to=300, 
+                                     orient=tk.HORIZONTAL, length=150,
+                                     command=self.update_speech_speed)
+        self.speed_slider.set(150)
+        self.speed_slider.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        self.speed_label = ttk.Label(speed_frame, text="150")
+        self.speed_label.grid(row=0, column=1, padx=(5, 0))
+        
+        # Volumen
+        ttk.Label(voice_config_frame, text="Volumen:").grid(row=4, column=0, sticky=tk.W, pady=(10, 2))
+        
+        volume_frame = ttk.Frame(voice_config_frame)
+        volume_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=2)
+        
+        self.volume_slider = ttk.Scale(volume_frame, from_=0.0, to=1.0, 
+                                      orient=tk.HORIZONTAL, length=150,
+                                      command=self.update_volume)
+        self.volume_slider.set(0.9)
+        self.volume_slider.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        self.volume_label = ttk.Label(volume_frame, text="0.9")
+        self.volume_label.grid(row=0, column=1, padx=(5, 0))
+        
+        # === INFORMACIÓN DEL SISTEMA ===
+        info_frame = ttk.LabelFrame(config_frame, text="ℹ️ Información", padding="5")
+        info_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Label(info_frame, text="Modelo: OpenHermes-2.5-Mistral-7B", 
+                 font=("Arial", 9)).grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Label(info_frame, text="Idioma: Inglés", 
+                 font=("Arial", 9)).grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Label(info_frame, text="Reconocimiento: Google Speech", 
+                 font=("Arial", 9)).grid(row=2, column=0, sticky=tk.W, pady=2)
+        
+        # === BOTONES DE ACCIÓN ===
+        action_frame = ttk.Frame(config_frame)
+        action_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+        
+        ttk.Button(action_frame, text="🔄 Reiniciar Config", 
+                  command=self.reset_config).grid(row=0, column=0, pady=5)
+        
+        # Configurar expansión
+        config_frame.columnconfigure(0, weight=1)
+        voice_config_frame.columnconfigure(0, weight=1)
+        speed_frame.columnconfigure(0, weight=1)
+        volume_frame.columnconfigure(0, weight=1)
+        silence_frame.columnconfigure(0, weight=1)
+    
+    def update_silence_threshold(self, value):
+        """Actualiza el umbral de silencio"""
+        self.silence_threshold = float(value)
+        self.silence_label.config(text=f"{self.silence_threshold:.1f}s")
+    
+    def update_speech_speed(self, value):
+        """Actualiza la velocidad de habla"""
+        speed = int(float(value))
+        self.engine.setProperty('rate', speed)
+        self.speed_label.config(text=str(speed))
+    
+    def update_volume(self, value):
+        """Actualiza el volumen"""
+        volume = float(value)
+        self.engine.setProperty('volume', volume)
+        self.volume_label.config(text=f"{volume:.1f}")
+    
+    def reset_config(self):
+        """Reinicia la configuración a valores por defecto"""
+        self.silence_slider.set(2.0)
+        self.speed_slider.set(150)
+        self.volume_slider.set(0.9)
+        self.response_mode.set("TEXT + TTS")
+        
+        self.silence_threshold = 2.0
+        self.engine.setProperty('rate', 150)
+        self.engine.setProperty('volume', 0.9)
+        
+        self.silence_label.config(text="2.0s")
+        self.speed_label.config(text="150")
+        self.volume_label.config(text="0.9")
     
     def load_model(self):
         """Carga el modelo en un hilo separado"""
@@ -335,13 +473,18 @@ You are a friendly English tutor. Respond naturally and conversationally in Engl
             self.root.after(0, lambda: self.show_response(error_msg))
     
     def show_response(self, response):
-        """Muestra la respuesta del modelo"""
-        self.add_message("IA", response)
-        self.status_var.set("¡Modelo cargado! Escribe tu mensaje en inglés o usa el micrófono")
+        """Muestra la respuesta del modelo según el modo configurado"""
+        mode = self.response_mode.get()
         
-        # Si está escuchando voz, responder automáticamente
-        if self.is_listening:
-            threading.Thread(target=self.speak_text, args=(response,), daemon=True).start()
+        if mode in ["TEXT", "TEXT + TTS"]:
+            self.add_message("IA", response)
+        
+        if mode in ["TTS", "TEXT + TTS"]:
+            # Si está escuchando voz, responder automáticamente
+            if self.is_listening:
+                threading.Thread(target=self.speak_text, args=(response,), daemon=True).start()
+        
+        self.status_var.set("¡Modelo cargado! Escribe tu mensaje en inglés o usa el micrófono")
     
     def speak_text(self, text):
         """Lee en voz alta el texto"""
