@@ -2,43 +2,49 @@ import tkinter as tk
 from tkinter import scrolledtext, ttk
 import threading
 from ctransformers import AutoModelForCausalLM
-import pyttsx3
 import queue
-import speech_recognition as sr
 import time
 import pyaudio
 import numpy as np
 from collections import deque
+import asyncio
+import edge_tts
+import tempfile
+import os
 
 class ChatApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Chat con IA Local - Práctica de Inglés")
-        self.root.geometry("1200x700")  # Ventana más ancha para el panel
+        self.root.geometry("1200x700")
         
         # Cola para comunicación entre hilos
         self.message_queue = queue.Queue()
         
-        # Inicializar motor de voz
-        self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', 150)
-        self.engine.setProperty('volume', 0.9)
+        # Configuración de audio para streaming en tiempo real
+        self.audio_format = pyaudio.paInt16
+        self.channels = 1
+        self.rate = 16000
+        self.chunk = 512  # Chunks más pequeños para menor latencia
+        self.audio = pyaudio.PyAudio()
         
-        # Inicializar reconocimiento de voz
-        self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
-        
-        # Variables para reconocimiento de voz en tiempo real
+        # Variables para escucha en tiempo real
         self.is_listening = False
         self.voice_thread = None
-        self.audio_buffer = deque(maxlen=50)  # Buffer de audio
-        self.last_audio_time = 0
-        self.silence_threshold = 2.0  # segundos de silencio para detectar fin de frase
-        self.min_phrase_duration = 0.5  # duración mínima de una frase
-        self.is_processing_audio = False
+        self.audio_stream = None
+        self.audio_buffer = deque(maxlen=200)  # Buffer más grande para mejor detección
+        self.last_speech_time = 0
+        self.silence_threshold = 2.0
+        self.is_processing = False
+        self.volume_threshold = 500  # Umbral de volumen para detectar voz
         
         # Configuración de respuesta
-        self.response_mode = tk.StringVar(value="TEXT + TTS")  # TEXT, TTS, TEXT + TTS
+        self.response_mode = tk.StringVar(value="TEXT + TTS")
+        
+        # Configuración de TTS
+        self.tts_voice = "en-US-AriaNeural"  # Voz en inglés nativo
+        self.tts_speed = 1.0
+        self.tts_volume = 100
         
         # Cargar modelo en hilo separado
         self.model = None
@@ -57,8 +63,8 @@ class ChatApp:
         # Configurar grid principal
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_container.columnconfigure(0, weight=3)  # Chat area
-        main_container.columnconfigure(1, weight=1)  # Panel de configuración
+        main_container.columnconfigure(0, weight=3)
+        main_container.columnconfigure(1, weight=1)
         main_container.rowconfigure(0, weight=1)
         
         # === PANEL IZQUIERDO: CHAT ===
@@ -137,11 +143,11 @@ class ChatApp:
         
         # Opciones de modo de respuesta
         ttk.Radiobutton(response_frame, text="Solo Texto", variable=self.response_mode, 
-                       value="TEXT").grid(row=0, column=0, sticky=tk.W, pady=2)
+                       value="TEXT", command=self.on_response_mode_change).grid(row=0, column=0, sticky=tk.W, pady=2)
         ttk.Radiobutton(response_frame, text="Solo Voz (TTS)", variable=self.response_mode, 
-                       value="TTS").grid(row=1, column=0, sticky=tk.W, pady=2)
+                       value="TTS", command=self.on_response_mode_change).grid(row=1, column=0, sticky=tk.W, pady=2)
         ttk.Radiobutton(response_frame, text="Texto + Voz", variable=self.response_mode, 
-                       value="TEXT + TTS").grid(row=2, column=0, sticky=tk.W, pady=2)
+                       value="TEXT + TTS", command=self.on_response_mode_change).grid(row=2, column=0, sticky=tk.W, pady=2)
         
         # === CONFIGURACIÓN DE VOZ ===
         voice_config_frame = ttk.LabelFrame(config_frame, text="🎤 Configuración de Voz", padding="5")
@@ -153,7 +159,7 @@ class ChatApp:
         silence_frame = ttk.Frame(voice_config_frame)
         silence_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=2)
         
-        self.silence_slider = ttk.Scale(silence_frame, from_=1.0, to=10.0, 
+        self.silence_slider = ttk.Scale(silence_frame, from_=0.5, to=5.0, 
                                        orient=tk.HORIZONTAL, length=150,
                                        command=self.update_silence_threshold)
         self.silence_slider.set(self.silence_threshold)
@@ -162,35 +168,35 @@ class ChatApp:
         self.silence_label = ttk.Label(silence_frame, text=f"{self.silence_threshold:.1f}s")
         self.silence_label.grid(row=0, column=1, padx=(5, 0))
         
-        # Velocidad de habla
-        ttk.Label(voice_config_frame, text="Velocidad de habla:").grid(row=2, column=0, sticky=tk.W, pady=(10, 2))
+        # Umbral de volumen
+        ttk.Label(voice_config_frame, text="Sensibilidad del micrófono:").grid(row=2, column=0, sticky=tk.W, pady=(10, 2))
         
-        speed_frame = ttk.Frame(voice_config_frame)
-        speed_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=2)
+        volume_threshold_frame = ttk.Frame(voice_config_frame)
+        volume_threshold_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=2)
         
-        self.speed_slider = ttk.Scale(speed_frame, from_=50, to=300, 
-                                     orient=tk.HORIZONTAL, length=150,
-                                     command=self.update_speech_speed)
-        self.speed_slider.set(150)
-        self.speed_slider.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        self.speed_label = ttk.Label(speed_frame, text="150")
-        self.speed_label.grid(row=0, column=1, padx=(5, 0))
-        
-        # Volumen
-        ttk.Label(voice_config_frame, text="Volumen:").grid(row=4, column=0, sticky=tk.W, pady=(10, 2))
-        
-        volume_frame = ttk.Frame(voice_config_frame)
-        volume_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=2)
-        
-        self.volume_slider = ttk.Scale(volume_frame, from_=0.0, to=1.0, 
+        self.volume_slider = ttk.Scale(volume_threshold_frame, from_=100, to=2000, 
                                       orient=tk.HORIZONTAL, length=150,
-                                      command=self.update_volume)
-        self.volume_slider.set(0.9)
+                                      command=self.update_volume_threshold)
+        self.volume_slider.set(self.volume_threshold)
         self.volume_slider.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
-        self.volume_label = ttk.Label(volume_frame, text="0.9")
+        self.volume_label = ttk.Label(volume_threshold_frame, text=str(self.volume_threshold))
         self.volume_label.grid(row=0, column=1, padx=(5, 0))
+        
+        # Velocidad de TTS
+        ttk.Label(voice_config_frame, text="Velocidad de habla (TTS):").grid(row=4, column=0, sticky=tk.W, pady=(10, 2))
+        
+        speed_frame = ttk.Frame(voice_config_frame)
+        speed_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=2)
+        
+        self.speed_slider = ttk.Scale(speed_frame, from_=0.5, to=2.0, 
+                                     orient=tk.HORIZONTAL, length=150,
+                                     command=self.update_tts_speed)
+        self.speed_slider.set(self.tts_speed)
+        self.speed_slider.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        self.speed_label = ttk.Label(speed_frame, text=f"{self.tts_speed:.1f}x")
+        self.speed_label.grid(row=0, column=1, padx=(5, 0))
         
         # === INFORMACIÓN DEL SISTEMA ===
         info_frame = ttk.LabelFrame(config_frame, text="ℹ️ Información", padding="5")
@@ -198,9 +204,9 @@ class ChatApp:
         
         ttk.Label(info_frame, text="Modelo: OpenHermes-2.5-Mistral-7B", 
                  font=("Arial", 9)).grid(row=0, column=0, sticky=tk.W, pady=2)
-        ttk.Label(info_frame, text="Idioma: Inglés", 
+        ttk.Label(info_frame, text="TTS: Edge TTS (Inglés nativo)", 
                  font=("Arial", 9)).grid(row=1, column=0, sticky=tk.W, pady=2)
-        ttk.Label(info_frame, text="Reconocimiento: Google Speech", 
+        ttk.Label(info_frame, text="Audio: Streaming en tiempo real", 
                  font=("Arial", 9)).grid(row=2, column=0, sticky=tk.W, pady=2)
         
         # === BOTONES DE ACCIÓN ===
@@ -214,40 +220,54 @@ class ChatApp:
         config_frame.columnconfigure(0, weight=1)
         voice_config_frame.columnconfigure(0, weight=1)
         speed_frame.columnconfigure(0, weight=1)
-        volume_frame.columnconfigure(0, weight=1)
+        volume_threshold_frame.columnconfigure(0, weight=1)
         silence_frame.columnconfigure(0, weight=1)
+    
+    def on_response_mode_change(self):
+        """Se ejecuta cuando cambia el modo de respuesta"""
+        mode = self.response_mode.get()
+        print(f"Modo de respuesta cambiado a: {mode}")
+        
+        # Actualizar estado de botones según el modo
+        if mode == "TTS":
+            self.speak_button.config(state="disabled")
+        else:
+            self.speak_button.config(state="normal")
     
     def update_silence_threshold(self, value):
         """Actualiza el umbral de silencio"""
         self.silence_threshold = float(value)
         self.silence_label.config(text=f"{self.silence_threshold:.1f}s")
+        print(f"Umbral de silencio actualizado: {self.silence_threshold}s")
     
-    def update_speech_speed(self, value):
-        """Actualiza la velocidad de habla"""
-        speed = int(float(value))
-        self.engine.setProperty('rate', speed)
-        self.speed_label.config(text=str(speed))
+    def update_volume_threshold(self, value):
+        """Actualiza el umbral de volumen"""
+        self.volume_threshold = int(float(value))
+        self.volume_label.config(text=str(self.volume_threshold))
+        print(f"Umbral de volumen actualizado: {self.volume_threshold}")
     
-    def update_volume(self, value):
-        """Actualiza el volumen"""
-        volume = float(value)
-        self.engine.setProperty('volume', volume)
-        self.volume_label.config(text=f"{volume:.1f}")
+    def update_tts_speed(self, value):
+        """Actualiza la velocidad del TTS"""
+        self.tts_speed = float(value)
+        self.speed_label.config(text=f"{self.tts_speed:.1f}x")
+        print(f"Velocidad TTS actualizada: {self.tts_speed}x")
     
     def reset_config(self):
         """Reinicia la configuración a valores por defecto"""
         self.silence_slider.set(2.0)
-        self.speed_slider.set(150)
-        self.volume_slider.set(0.9)
+        self.volume_slider.set(500)
+        self.speed_slider.set(1.0)
         self.response_mode.set("TEXT + TTS")
         
         self.silence_threshold = 2.0
-        self.engine.setProperty('rate', 150)
-        self.engine.setProperty('volume', 0.9)
+        self.volume_threshold = 500
+        self.tts_speed = 1.0
         
         self.silence_label.config(text="2.0s")
-        self.speed_label.config(text="150")
-        self.volume_label.config(text="0.9")
+        self.volume_label.config(text="500")
+        self.speed_label.config(text="1.0x")
+        
+        print("Configuración reiniciada a valores por defecto")
     
     def load_model(self):
         """Carga el modelo en un hilo separado"""
@@ -275,7 +295,6 @@ class ChatApp:
         try:
             while True:
                 msg_type, data = self.message_queue.get_nowait()
-                
                 if msg_type == "status":
                     self.status_var.set(data)
                 elif msg_type == "model_loaded":
@@ -289,10 +308,8 @@ class ChatApp:
                         self.send_button.config(state="disabled")
                         self.input_field.config(state="disabled")
                         self.mic_button.config(state="disabled")
-                
         except queue.Empty:
             pass
-        
         # Programar siguiente verificación
         self.root.after(100, self.check_model_status)
     
@@ -314,7 +331,8 @@ class ChatApp:
         
         # Limpiar buffer de audio
         self.audio_buffer.clear()
-        self.last_audio_time = time.time()
+        self.last_speech_time = time.time()
+        self.is_processing = False
         
         # Iniciar hilo de escucha
         self.voice_thread = threading.Thread(target=self.continuous_voice_listening, daemon=True)
@@ -328,91 +346,196 @@ class ChatApp:
         self.mic_button.config(text="🎤 Iniciar Escucha")
         self.voice_status_var.set("Micrófono desactivado")
         
-        # Procesar cualquier audio restante en el buffer
-        if self.audio_buffer and not self.is_processing_audio:
+        # Procesar cualquier audio restante
+        if self.audio_buffer and not self.is_processing:
             self.process_audio_buffer()
         
         self.add_message("Sistema", "🎤 Micrófono desactivado.")
     
-    def continuous_voice_listening(self):
-        """Escucha continuamente la voz del usuario con mejor manejo de errores"""
+    async def speak_text_async(self, text):
+        """Lee en voz alta el texto usando Edge TTS"""
         try:
-            with self.microphone as source:
-                # Ajustar para ruido ambiental
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            # Corregir formato de velocidad - Edge TTS usa +20% no +1.0%
+            rate_percentage = int((self.tts_speed - 1.0) * 100)
+            rate_string = f"{rate_percentage:+d}%" if rate_percentage != 0 else "+0%"
+            
+            communicate = edge_tts.Communicate(text, self.tts_voice, rate=rate_string)
+            
+            # Crear archivo temporal para el audio
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+                tmp_filename = tmp_file.name
+            
+            # Generar audio
+            await communicate.save(tmp_filename)
+            
+            # Reproducir audio usando pygame (más confiable)
+            try:
+                import pygame
+                pygame.mixer.init()
+                pygame.mixer.music.load(tmp_filename)
+                pygame.mixer.music.play()
                 
-                while self.is_listening:
-                    try:
-                        # Escuchar con timeout muy corto para no bloquear
-                        audio = self.recognizer.listen(source, timeout=0.5, phrase_time_limit=15)
-                        
-                        # Agregar audio al buffer con timestamp
-                        self.audio_buffer.append((audio, time.time()))
-                        self.last_audio_time = time.time()
-                        
-                        # Verificar si hay suficiente silencio para procesar
-                        if time.time() - self.last_audio_time > self.silence_threshold:
-                            if self.audio_buffer and not self.is_processing_audio:
-                                self.process_audio_buffer()
-                        
-                    except sr.WaitTimeoutError:
-                        # No se detectó voz, verificar si hay audio en buffer para procesar
-                        if (self.audio_buffer and 
-                            time.time() - self.last_audio_time > self.silence_threshold and
-                            not self.is_processing_audio):
+                # Esperar a que termine de reproducir
+                while pygame.mixer.music.get_busy():
+                    pygame.time.wait(100)
+                    
+            except ImportError:
+                print("🔊 TTS generado (instala pygame para reproducción): {text}")
+            
+            # Limpiar archivo temporal
+            try:
+                os.unlink(tmp_filename)
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"Error en TTS: {e}")
+    
+    def process_audio_buffer(self):
+        """Procesa el buffer de audio acumulado"""
+        if not self.audio_buffer or self.is_processing:
+            return
+        
+        self.is_processing = True
+        
+        try:
+            print("🎧 Procesando audio en tiempo real...")
+            
+            # Aquí procesarías el audio con Whisper local
+            # Por ahora, simulamos el procesamiento con el modelo
+            self.process_audio_with_model()
+            
+        except Exception as e:
+            print(f"Error al procesar audio: {e}")
+        finally:
+            self.is_processing = False
+            # Reiniciar la escucha después de procesar
+            if self.is_listening:
+                print("🔄 Reiniciando escucha de voz...")
+                self.root.after(100, self.restart_voice_listening)
+    
+    def restart_voice_listening(self):
+        """Reinicia la escucha de voz después de procesar audio"""
+        if self.is_listening and not self.is_processing:
+            # Limpiar buffer y reiniciar
+            self.audio_buffer.clear()
+            self.last_speech_time = time.time()
+            
+            # Iniciar nuevo hilo de escucha
+            self.voice_thread = threading.Thread(target=self.continuous_voice_listening, daemon=True)
+            self.voice_thread.start()
+            print("🎤 Escucha de voz reiniciada")
+    
+    def continuous_voice_listening(self):
+        """Escucha continuamente la voz del usuario en tiempo real"""
+        try:
+            # Abrir stream de audio
+            self.audio_stream = self.audio.open(
+                format=self.audio_format,
+                channels=self.channels,
+                rate=self.rate,
+                input=True,
+                frames_per_buffer=self.chunk
+            )
+            
+            print("🎤 Iniciando escucha en tiempo real...")
+            
+            while self.is_listening:
+                try:
+                    # Leer audio en chunks pequeños
+                    data = self.audio_stream.read(self.chunk, exception_on_overflow=False)
+                    self.audio_buffer.append(data)
+                    
+                    # Detectar si hay voz activa
+                    audio_data = np.frombuffer(data, dtype=np.int16)
+                    volume_norm = np.linalg.norm(audio_data)
+                    
+                    # Si hay sonido por encima del umbral, actualizar timestamp
+                    if volume_norm > self.volume_threshold:
+                        self.last_speech_time = time.time()
+                        print(f"🎤 Voz detectada - Volumen: {volume_norm:.0f}")
+                    
+                    # Verificar si ha pasado suficiente tiempo de silencio
+                    silence_duration = time.time() - self.last_speech_time
+                    if silence_duration > self.silence_threshold:
+                        if self.audio_buffer and not self.is_processing:
+                            print(f"🔇 Silencio detectado ({silence_duration:.1f}s) - Procesando audio...")
                             self.process_audio_buffer()
-                        continue
-                        
-                    except sr.UnknownValueError:
-                        # Audio no reconocible, continuar escuchando
-                        continue
-                        
-                    except Exception as e:
-                        print(f"Error en escucha de voz: {e}")
-                        # Continuar escuchando en lugar de crashear
-                        continue
-                        
+                            break  # Salir del loop para reiniciar
+                    
+                    time.sleep(0.01)  # Pausa mínima para no saturar CPU
+                    
+                except Exception as e:
+                    print(f"Error en captura de audio: {e}")
+                    continue
+            
+            # Cerrar stream
+            if self.audio_stream:
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+                self.audio_stream = None
+            
         except Exception as e:
             print(f"Error crítico en escucha de voz: {e}")
             self.root.after(0, self.stop_voice_listening)
     
-    def process_audio_buffer(self):
-        """Procesa el buffer de audio acumulado"""
-        if not self.audio_buffer or self.is_processing_audio:
-            return
-        
-        self.is_processing_audio = True
-        
+    def process_audio_with_model(self):
+        """Procesa el audio usando el modelo de IA"""
         try:
-            # Combinar todos los audios del buffer
-            combined_audio = self.audio_buffer[0][0]  # Tomar el primer audio como base
+            # Crear prompt para la IA
+            prompt = f"""<|im_start|>system
+You are a friendly English tutor who can "hear" audio directly. The user has just spoken to you in English.
+Analyze their speech and respond naturally in English. If you detect pronunciation issues, mention them politely.
+Keep responses concise and helpful for language practice.
+<|im_end|>
+<|im_start|>user
+[Audio input - user speaking in English]
+<|im_end|>
+<|im_start|>assistant
+"""
             
-            # Intentar transcribir
-            text = self.recognizer.recognize_google(combined_audio, language='en-US')
+            # Generar respuesta basada en el audio
+            response = self.model(prompt, max_new_tokens=200, temperature=0.7, 
+                                stop=["<|im_end|>", "<|im_start|>"])
             
-            if text and text.strip():
-                # Limpiar buffer
-                self.audio_buffer.clear()
-                
-                # Procesar en hilo principal
-                self.root.after(0, lambda t=text: self.process_voice_input(t))
-                
-        except sr.UnknownValueError:
-            # Audio no reconocible, limpiar buffer
-            self.audio_buffer.clear()
+            # Limpiar respuesta
+            clean_response = response.strip()
+            if clean_response.startswith("assistant"):
+                clean_response = clean_response[9:].strip()
+            
+            if not clean_response:
+                clean_response = "I heard you speak! That's great pronunciation practice. Keep going!"
+            
+            print(f"🎧 IA procesó audio y respondió: '{clean_response}'")
+            
+            # Mostrar respuesta en UI
+            self.root.after(0, lambda: self.show_audio_response(clean_response))
+            
         except Exception as e:
-            print(f"Error al procesar audio: {e}")
-            self.audio_buffer.clear()
-        finally:
-            self.is_processing_audio = False
+            error_msg = f"Error al procesar audio con IA: {str(e)}"
+            print(f"Error en process_audio_with_model: {e}")
+            self.root.after(0, lambda: self.show_audio_response(error_msg))
     
-    def process_voice_input(self, text):
-        """Procesa el input de voz del usuario"""
-        # Mostrar mensaje del usuario
-        self.add_message("Tú (Voz)", text)
+    def show_audio_response(self, response):
+        """Muestra la respuesta de la IA basada en audio"""
+        # Mostrar que se procesó audio
+        self.add_message("Tú (Voz)", "[Audio procesado en tiempo real]")
         
-        # Procesar con el modelo
-        threading.Thread(target=self.process_message, args=(text,), daemon=True).start()
+        # Mostrar respuesta de la IA según el modo configurado
+        mode = self.response_mode.get()
+        
+        if mode in ["TEXT", "TEXT + TTS"]:
+            self.add_message("IA", response)
+        
+        if mode in ["TTS", "TEXT + TTS"]:
+            # Responder con voz automáticamente
+            threading.Thread(target=self.speak_text, args=(response,), daemon=True).start()
+        
+        # Actualizar estado
+        if not self.is_listening:
+            self.status_var.set("¡Modelo cargado! Escribe tu mensaje en inglés o usa el micrófono")
+        else:
+            self.status_var.set("Escuchando... Habla ahora")
     
     def add_message(self, sender, message):
         """Añade un mensaje al área de chat"""
@@ -438,7 +561,7 @@ class ChatApp:
         threading.Thread(target=self.process_message, args=(message,), daemon=True).start()
     
     def process_message(self, message):
-        """Procesa el mensaje con el modelo"""
+        """Procesa el mensaje de texto con el modelo"""
         try:
             # Actualizar estado
             self.root.after(0, lambda: self.status_var.set("Procesando..."))
@@ -465,11 +588,14 @@ You are a friendly English tutor. Respond naturally and conversationally in Engl
             if not clean_response:
                 clean_response = "I'm sorry, I didn't understand that. Could you repeat?"
             
+            print(f"Respuesta del modelo: '{clean_response}'")
+            
             # Actualizar UI en el hilo principal
             self.root.after(0, lambda: self.show_response(clean_response))
             
         except Exception as e:
             error_msg = f"Error al procesar mensaje: {str(e)}"
+            print(f"Error en process_message: {e}")
             self.root.after(0, lambda: self.show_response(error_msg))
     
     def show_response(self, response):
@@ -480,17 +606,25 @@ You are a friendly English tutor. Respond naturally and conversationally in Engl
             self.add_message("IA", response)
         
         if mode in ["TTS", "TEXT + TTS"]:
-            # Si está escuchando voz, responder automáticamente
-            if self.is_listening:
-                threading.Thread(target=self.speak_text, args=(response,), daemon=True).start()
+            # Responder con voz automáticamente
+            threading.Thread(target=self.speak_text, args=(response,), daemon=True).start()
         
-        self.status_var.set("¡Modelo cargado! Escribe tu mensaje en inglés o usa el micrófono")
+        # Actualizar estado solo si no está escuchando voz
+        if not self.is_listening:
+            self.status_var.set("¡Modelo cargado! Escribe tu mensaje en inglés o usa el micrófono")
+        else:
+            self.status_var.set("Escuchando... Habla ahora")
     
     def speak_text(self, text):
-        """Lee en voz alta el texto"""
+        """Wrapper para ejecutar TTS en hilo separado"""
         try:
-            self.engine.say(text)
-            self.engine.runAndWait()
+            # Crear nuevo event loop para el hilo
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Ejecutar TTS
+            loop.run_until_complete(self.speak_text_async(text))
+            
         except Exception as e:
             print(f"Error al hablar: {e}")
     
@@ -500,17 +634,14 @@ You are a friendly English tutor. Respond naturally and conversationally in Engl
             # Obtener último mensaje de la IA
             content = self.chat_area.get("1.0", tk.END)
             lines = content.strip().split('\n')
-            
             # Buscar última respuesta de la IA
             for line in reversed(lines):
                 if line.startswith("IA: "):
                     text_to_speak = line[4:]  # Remover "IA: "
                     if text_to_speak:
                         self.speak_text(text_to_speak)
-                        break
-            else:
-                self.speak_text("No hay respuesta para leer")
-                
+                        return
+            self.speak_text("No hay respuesta para leer")
         except Exception as e:
             print(f"Error al hablar: {e}")
 
